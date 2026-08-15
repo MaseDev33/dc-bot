@@ -49,10 +49,17 @@ class AppealModal(discord.ui.Modal, title="Submit an Appeal"):
                     if interaction2.guild is None or not (interaction2.user.guild_permissions.manage_guild or interaction2.user.guild_permissions.moderate_members or interaction2.user.guild_permissions.ban_members):
                         await interaction2.response.send_message(embed=error_embed("Unauthorized", "You are not authorized to perform this action."), ephemeral=True)
                         return
+                    try:
+                        await interaction2.guild.unban(discord.Object(id=user.id), reason=f"Appeal accepted by {interaction2.user} ({interaction2.user.id})")
+                    except Exception:
+                        logger.exception("Failed to unban user %s after appeal acceptance", user.id)
+                        await interaction2.response.send_message(embed=error_embed("Unban failed", "The appeal was accepted, but the user could not be unbanned."), ephemeral=True)
+                        return
+
                     await self.db.execute("UPDATE appeals SET status = ?, moderator_id = ?, decision = ?, decision_at = ? WHERE id = ?", ("accepted", interaction2.user.id, "accepted", int(datetime.now(timezone.utc).timestamp()), appeal_id))
                     await interaction2.response.edit_message(embed=info_embed("Appeal accepted", f"Appeal #{appeal_id} accepted by {interaction2.user.mention}"), view=None)
                     try:
-                        await user.send(embed=success_embed("Appeal accepted", "Your appeal has been accepted. A moderator will follow up."))
+                        await user.send(embed=success_embed("Appeal accepted", "Your appeal has been accepted. Your ban has been removed and a moderator will follow up."))
                     except Exception:
                         logger.exception("Failed to DM appeal accepted")
 

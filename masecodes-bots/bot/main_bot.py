@@ -34,13 +34,8 @@ class MainBot(commands.Bot):
             local_cmds = None
         logger.info("Local command tree size before sync: %s", local_cmds)
 
-        if self.guild_id:
-            guild = discord.Object(id=self.guild_id)
-            synced = await self.tree.sync(guild=guild)
-            logger.info("Synced %d app commands to guild %s", len(synced), self.guild_id)
-        else:
-            synced = await self.tree.sync()
-            logger.info("Synced %d global app commands", len(synced))
+        synced = await self.tree.sync()
+        logger.info("Synced %d global app commands", len(synced))
         # log bot identity and application id for troubleshooting
         try:
             logger.info("Main bot user: %s (id=%s) application_id=%s", getattr(self.user, 'name', None), getattr(self.user, 'id', None), self.application_id)
@@ -321,6 +316,29 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
         e = info_embed("Pong", f"Latency: {round(bot.latency*1000)}ms")
         await interaction.response.send_message(embed=e)
 
+    @bot.tree.command(name="refresh-commands")
+    @app_commands.allowed_contexts(
+        guilds=True,
+        dms=False,
+        private_channels=False,
+    )
+    @app_commands.describe()
+    async def refresh_commands(interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(embed=error_embed("Guild only", "This refresh command can only be used in a server."))
+            return
+        if not interaction.user.guild_permissions.manage_guild and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(embed=error_embed("Permission denied", "You need Manage Server or Administrator to refresh slash commands."))
+            return
+        guild = discord.Object(id=interaction.guild.id)
+        try:
+            await bot.tree.clear_commands(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            await interaction.response.send_message(embed=success_embed("Commands refreshed", f"Synced {len(synced)} slash commands for this guild."))
+        except Exception:
+            logger.exception("Failed to refresh slash commands")
+            await interaction.response.send_message(embed=error_embed("Refresh failed", "The slash command tree could not be refreshed."))
+
     @bot.tree.command(name="warn")
     @app_commands.allowed_contexts(
         guilds=True,
@@ -335,16 +353,21 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
         if not interaction.user.guild_permissions.moderate_members:
             await interaction.response.send_message(embed=error_embed("Permission denied", "You lack Moderate Members."))
             return
+        # Attempt to DM the user before recording the warning
+        dm_sent = False
+        try:
+            dm = info_embed("You have been warned", f"Server: {interaction.guild.name}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            await user.send(embed=dm)
+            dm_sent = True
+        except Exception:
+            logger.exception("Failed to DM warned user")
+
         ts = int(datetime.now(timezone.utc).timestamp())
         await db.execute("INSERT INTO warnings (user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?)", (user.id, interaction.user.id, reason, ts))
         e = info_embed("🛡️ User Warned", f"User: {user.mention}\nModerator: {interaction.user.mention}\nReason: {reason}")
+        if not dm_sent:
+            e.add_field(name="Notice", value="Could not DM the user before warning.")
         await interaction.response.send_message(embed=e)
-        # DM user
-        try:
-            dm = info_embed("You have been warned", f"Server: {interaction.guild.name}\nReason: {reason}")
-            await user.send(embed=dm)
-        except Exception:
-            logger.exception("Failed to DM warned user")
         # mod log
         mod_ch = os.getenv("MOD_LOG_CHANNEL_ID")
         if mod_ch:
@@ -389,11 +412,22 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
             await interaction.response.send_message(embed=error_embed("Permission denied", "You lack Ban Members."))
             return
         guild = interaction.guild
+        # DM the user before banning
+        dm_sent = False
+        try:
+            dm = info_embed("You have been banned", f"Server: {interaction.guild.name}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            await user.send(embed=dm)
+            dm_sent = True
+        except Exception:
+            logger.exception("Failed to DM user before ban")
+
         try:
             await guild.ban(user, reason=reason)
             ts = int(datetime.now(timezone.utc).timestamp())
             await db.execute("INSERT INTO moderation_actions (action, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)", ("ban", user.id, interaction.user.id, reason, ts))
-            e = info_embed("User Banned", f"User: {user.mention}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            e = info_embed("User Banned", f"User: {getattr(user, 'mention', str(user))}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            if not dm_sent:
+                e.add_field(name="Notice", value="Could not DM the user before banning.")
             await interaction.response.send_message(embed=e)
             mod_ch = os.getenv("MOD_LOG_CHANNEL_ID")
             if mod_ch:
@@ -430,11 +464,22 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
             await interaction.response.send_message(embed=error_embed("Invalid duration", "Use formats like 30s, 5m, 3h, 5d, 1w."))
             return
         expires = int((datetime.now(timezone.utc) + timedelta(seconds=secs)).timestamp())
+        # Attempt to DM before tempbanning
+        dm_sent = False
+        try:
+            dm = info_embed("You have been temporarily banned", f"Server: {interaction.guild.name}\nDuration: {duration}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            await user.send(embed=dm)
+            dm_sent = True
+        except Exception:
+            logger.exception("Failed to DM user before tempban")
+
         try:
             await interaction.guild.ban(user, reason=reason)
             ts = int(datetime.now(timezone.utc).timestamp())
             await db.execute("INSERT OR REPLACE INTO temporary_bans (user_id, moderator_id, reason, expires_at, created_at) VALUES (?, ?, ?, ?, ?)", (user.id, interaction.user.id, reason, expires, ts))
-            e = info_embed("Temporary ban", f"User: {user.mention}\nDuration: {duration}\nReason: {reason}")
+            e = info_embed("Temporary ban", f"User: {getattr(user, 'mention', str(user))}\nDuration: {duration}\nReason: {reason}")
+            if not dm_sent:
+                e.add_field(name="Notice", value="Could not DM the user before tempban.")
             await interaction.response.send_message(embed=e)
             mod_ch = os.getenv("MOD_LOG_CHANNEL_ID")
             if mod_ch:
@@ -482,10 +527,22 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
         if not interaction.user.guild_permissions.kick_members:
             await interaction.response.send_message(embed=error_embed("Permission denied", "You lack Kick Members."))
             return
+        # DM before kicking
+        dm_sent = False
+        try:
+            dm = info_embed("You have been kicked", f"Server: {interaction.guild.name}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            await user.send(embed=dm)
+            dm_sent = True
+        except Exception:
+            logger.exception("Failed to DM user before kick")
+
         try:
             await user.kick(reason=reason)
             await db.execute("INSERT INTO moderation_actions (action, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)", ("kick", user.id, interaction.user.id, reason, int(datetime.now(timezone.utc).timestamp())))
-            await interaction.response.send_message(embed=info_embed("User kicked", f"{user.mention} — {reason}"))
+            e = info_embed("User kicked", f"{user.mention} — {reason}")
+            if not dm_sent:
+                e.add_field(name="Notice", value="Could not DM the user before kick.")
+            await interaction.response.send_message(embed=e)
         except Exception:
             logger.exception("Kick failed")
             await interaction.response.send_message(embed=error_embed("Kick failed", "Could not kick user."))
@@ -572,201 +629,5 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
             e = info_embed("Subscription status", "You are NOT subscribed to blog DMs.")
         await interaction.response.send_message(embed=e)
 
-    # --- Text (prefix) commands for main bot (m! prefix) ---
-    @bot.command(name="ping")
-    async def ping_text(ctx: commands.Context):
-        e = info_embed("Pong", f"Latency: {round(bot.latency*1000)}ms")
-        await ctx.send(embed=e)
-
-    @bot.command(name="subscribe")
-    async def subscribe_text(ctx: commands.Context):
-        user_id = ctx.author.id
-        exist = await db.fetchone("SELECT 1 FROM blog_subscribers WHERE user_id = ?", (user_id,))
-        if exist:
-            e = info_embed("Already subscribed", "You are already subscribed to blog notifications.")
-            await ctx.send(embed=e)
-            return
-        ts = int(datetime.now(timezone.utc).timestamp())
-        await db.execute("INSERT INTO blog_subscribers (user_id, subscribed_at) VALUES (?, ?)", (user_id, ts))
-        e = success_embed("Subscribed", "You will receive DMs for new blog posts.")
-        await ctx.send(embed=e)
-
-    @bot.command(name="unsubscribe")
-    async def unsubscribe_text(ctx: commands.Context):
-        user_id = ctx.author.id
-        await db.execute("DELETE FROM blog_subscribers WHERE user_id = ?", (user_id,))
-        e = success_embed("Unsubscribed", "You will no longer receive blog DMs.")
-        await ctx.send(embed=e)
-
-    @bot.command(name="substatus")
-    async def substatus_text(ctx: commands.Context):
-        user_id = ctx.author.id
-        exist = await db.fetchone("SELECT 1 FROM blog_subscribers WHERE user_id = ?", (user_id,))
-        if exist:
-            e = info_embed("Subscription status", "You are subscribed to blog DMs.")
-        else:
-            e = info_embed("Subscription status", "You are NOT subscribed to blog DMs.")
-        await ctx.send(embed=e)
-
-    @bot.command(name="help")
-    async def help_text(ctx: commands.Context):
-        e = info_embed("m! Help", "Available commands for the main bot (prefix `m!`).")
-        e.add_field(name="Moderation", value="m!warn, m!warnings, m!timeout, m!kick, m!ban, m!tempban, m!unban, m!clear, m!lock, m!unlock", inline=False)
-        e.add_field(name="Blog Subscriptions", value="m!subscribe, m!unsubscribe, m!substatus", inline=False)
-        e.add_field(name="Utility", value="m!ping, m!help", inline=False)
-        e.set_footer(text="masecodes.dev")
-        await ctx.send(embed=e)
-
-    @bot.command(name="warn")
-    async def warn_text(ctx: commands.Context, user: discord.Member, *, reason: str):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.moderate_members:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Moderate Members."))
-            return
-        ts = int(datetime.now(timezone.utc).timestamp())
-        await db.execute("INSERT INTO warnings (user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?)", (user.id, ctx.author.id, reason, ts))
-        e = info_embed("🛡️ User Warned", f"User: {user.mention}\nModerator: {ctx.author.mention}\nReason: {reason}")
-        await ctx.send(embed=e)
-        try:
-            await user.send(embed=info_embed("You have been warned", f"Server: {ctx.guild.name}\nReason: {reason}"))
-        except Exception:
-            logger.exception("Failed to DM warned user")
-
-    @bot.command(name="warnings")
-    async def warnings_text(ctx: commands.Context, user: discord.Member):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.moderate_members:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Moderate Members."))
-            return
-        rows = await db.fetchall("SELECT id, moderator_id, reason, timestamp FROM warnings WHERE user_id = ? ORDER BY timestamp DESC", (user.id,))
-        if not rows:
-            await ctx.send(embed=info_embed("Warnings", "No warnings found."))
-            return
-        desc = "\n\n".join([f"ID: {r[0]} — Moderator: <@{r[1]}> — {r[2]}" for r in rows[:10]])
-        e = info_embed(f"Warnings for {user}", desc)
-        await ctx.send(embed=e)
-
-    @bot.command(name="ban")
-    async def ban_text(ctx: commands.Context, user: discord.User, *, reason: str):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.ban_members:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Ban Members."))
-            return
-        try:
-            await ctx.guild.ban(user, reason=reason)
-            ts = int(datetime.now(timezone.utc).timestamp())
-            await db.execute("INSERT INTO moderation_actions (action, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)", ("ban", user.id, ctx.author.id, reason, ts))
-            e = info_embed("User Banned", f"User: {user.mention}\nModerator: {ctx.author.mention}\nReason: {reason}")
-            await ctx.send(embed=e)
-        except Exception:
-            logger.exception("Ban failed")
-            await ctx.send(embed=error_embed("Ban failed", "Could not ban the user."))
-
-    @bot.command(name="tempban")
-    async def tempban_text(ctx: commands.Context, user: discord.User, duration: str, *, reason: str):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.ban_members:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Ban Members."))
-            return
-        mul = {"s":1, "m":60, "h":3600, "d":86400, "w":604800}
-        try:
-            unit = duration[-1]
-            val = int(duration[:-1])
-            secs = val * mul.get(unit, 0)
-            if secs <= 0:
-                raise ValueError()
-        except Exception:
-            await ctx.send(embed=error_embed("Invalid duration", "Use formats like 30s, 5m, 3h, 5d, 1w."))
-            return
-        expires = int((datetime.now(timezone.utc) + timedelta(seconds=secs)).timestamp())
-        try:
-            await ctx.guild.ban(user, reason=reason)
-            ts = int(datetime.now(timezone.utc).timestamp())
-            await db.execute("INSERT OR REPLACE INTO temporary_bans (user_id, moderator_id, reason, expires_at, created_at) VALUES (?, ?, ?, ?, ?)", (user.id, ctx.author.id, reason, expires, ts))
-            e = info_embed("Temporary ban", f"User: {user.mention}\nDuration: {duration}\nReason: {reason}")
-            await ctx.send(embed=e)
-        except Exception:
-            logger.exception("Tempban failed")
-            await ctx.send(embed=error_embed("Tempban failed", "Could not tempban the user."))
-
-    @bot.command(name="unban")
-    async def unban_text(ctx: commands.Context, user_id: str):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.ban_members:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Ban Members."))
-            return
-        try:
-            uid = int(user_id)
-            await ctx.guild.unban(discord.Object(id=uid))
-            await db.execute("INSERT INTO moderation_actions (action, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)", ("unban", uid, ctx.author.id, "manual unban", int(datetime.now(timezone.utc).timestamp())))
-            await ctx.send(embed=success_embed("Unbanned", f"Unbanned <@{uid}>") )
-        except Exception:
-            logger.exception("Unban failed")
-            await ctx.send(embed=error_embed("Unban failed", "Could not unban the ID provided."))
-
-    @bot.command(name="kick")
-    async def kick_text(ctx: commands.Context, user: discord.Member, *, reason: str):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.kick_members:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Kick Members."))
-            return
-        try:
-            await user.kick(reason=reason)
-            await db.execute("INSERT INTO moderation_actions (action, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)", ("kick", user.id, ctx.author.id, reason, int(datetime.now(timezone.utc).timestamp())))
-            await ctx.send(embed=info_embed("User kicked", f"{user.mention} — {reason}"))
-        except Exception:
-            logger.exception("Kick failed")
-            await ctx.send(embed=error_embed("Kick failed", "Could not kick user."))
-
-    @bot.command(name="clear")
-    async def clear_text(ctx: commands.Context, amount: int):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.manage_messages:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Manage Messages."))
-            return
-        if amount < 1 or amount > 1000:
-            await ctx.send(embed=error_embed("Invalid amount", "Enter a number between 1 and 1000."))
-            return
-        deleted = await ctx.channel.purge(limit=amount)
-        await db.execute("INSERT INTO moderation_actions (action, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)", ("clear", None, ctx.author.id, f"cleared {len(deleted)} messages", int(datetime.now(timezone.utc).timestamp())))
-        await ctx.send(embed=success_embed("Messages deleted", f"Deleted {len(deleted)} messages."))
-
-    @bot.command(name="lock")
-    async def lock_text(ctx: commands.Context):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.manage_channels:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Manage Channels."))
-            return
-        everyone = ctx.guild.default_role
-        await ctx.channel.set_permissions(everyone, send_messages=False)
-        await ctx.send(embed=info_embed("Channel locked", "This channel is now read-only for regular members."))
-
-    @bot.command(name="unlock")
-    async def unlock_text(ctx: commands.Context):
-        if ctx.guild is None:
-            await ctx.send(embed=error_embed("Guild only", "This command can only be used in a server."))
-            return
-        if not ctx.author.guild_permissions.manage_channels:
-            await ctx.send(embed=error_embed("Permission denied", "You lack Manage Channels."))
-            return
-        everyone = ctx.guild.default_role
-        await ctx.channel.set_permissions(everyone, send_messages=None)
-        await ctx.send(embed=info_embed("Channel unlocked", "This channel has been unlocked."))
 
     return bot
