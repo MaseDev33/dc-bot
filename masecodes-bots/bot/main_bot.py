@@ -14,6 +14,25 @@ from .embeds import success_embed, error_embed, info_embed
 
 logger = logging.getLogger("masecodes.main")
 
+PROTECTED_ROLE_ID = 1537861422107852830
+OWNER_ID = 1480898643123896480
+
+
+async def check_protected_target(interaction: discord.Interaction, member: discord.Member | None, action: str) -> bool:
+    if member is None:
+        return True
+    if not any(role.id == PROTECTED_ROLE_ID for role in member.roles):
+        return True
+    if interaction.user.id == OWNER_ID:
+        return True
+    await interaction.response.send_message(
+        embed=error_embed(
+            "Protected user",
+            f"<@{member.id}> has the protected role and cannot be {action} unless <@{OWNER_ID}> performs the action.",
+        )
+    )
+    return False
+
 
 class MainBot(commands.Bot):
     def __init__(self, db: Database, guild_id: Optional[int], **kwargs):
@@ -221,27 +240,43 @@ class MainBot(commands.Bot):
                 try:
                     if ev_type == "PushEvent":
                         p = ev.get("payload", {})
-                        commits = p.get("commits", [])
+                        commits = p.get("commits") or []
                         count = len(commits)
+                        actor = ev.get("actor", {}).get("login", "unknown")
+                        ref = p.get("ref", "")
+                        compare_url = p.get("compare") or ""
                         title = f"🐙 GitHub Push — {repo_name}"
-                        desc_lines = [f"{count} commit(s) pushed by {ev.get('actor', {}).get('login')}"]
-                        for c in commits[:5]:
-                            sha = c.get("sha", "")[:7]
-                            msg = c.get("message", "").splitlines()[0]
-                            url = c.get("url") or c.get("html_url") or ""
-                            if url.startswith("api."):
-                                url = url.replace("api.", "").replace("repos/", "")
-                            if url:
-                                desc_lines.append(f"• [`{sha}`]({url}) {msg}")
-                            else:
-                                desc_lines.append(f"• `{sha}` {msg}")
-                        embed = info_embed(title, "\n".join(desc_lines))
-                        if commits:
+
+                        if count:
+                            desc_lines = [f"{count} commit(s) pushed by {actor}"]
+                            for c in commits[:5]:
+                                sha = c.get("sha", "")[:7]
+                                msg = c.get("message", "").splitlines()[0]
+                                url = c.get("url") or c.get("html_url") or ""
+                                if url.startswith("api."):
+                                    url = url.replace("api.", "").replace("repos/", "")
+                                if url:
+                                    desc_lines.append(f"• [`{sha}`]({url}) {msg}")
+                                else:
+                                    desc_lines.append(f"• `{sha}` {msg}")
+                            if ref:
+                                desc_lines.append(f"Ref: {ref}")
+                            embed = info_embed(title, "\n".join(desc_lines))
                             first_url = commits[0].get("url") or commits[0].get("html_url") or ""
                             if first_url.startswith("api."):
                                 first_url = first_url.replace("api.", "").replace("repos/", "")
                             if first_url:
                                 embed.add_field(name="View", value=f"[Commit Link]({first_url})")
+                            if compare_url:
+                                embed.add_field(name="Compare", value=f"[GitHub compare]({compare_url})", inline=False)
+                        else:
+                            desc_lines = [f"A push event was received from {actor}."]
+                            if ref:
+                                desc_lines.append(f"Ref: {ref}")
+                            desc_lines.append("The upstream payload did not include any commit entries.")
+                            embed = info_embed(title, "\n".join(desc_lines))
+                            if compare_url:
+                                embed.add_field(name="Compare", value=f"[GitHub compare]({compare_url})", inline=False)
                         await ch.send(embed=embed)
 
                     elif ev_type == "PullRequestEvent":
@@ -419,6 +454,9 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
             await interaction.response.send_message(embed=error_embed("Permission denied", "You lack Ban Members."))
             return
         guild = interaction.guild
+        target_member = guild.get_member(user.id)
+        if not await check_protected_target(interaction, target_member, "banned"):
+            return
         # DM the user before banning
         dm_sent = False
         try:
@@ -458,6 +496,9 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
             return
         if not interaction.user.guild_permissions.ban_members:
             await interaction.response.send_message(embed=error_embed("Permission denied", "You lack Ban Members."))
+            return
+        target_member = interaction.guild.get_member(user.id)
+        if not await check_protected_target(interaction, target_member, "tempbanned"):
             return
         # parse duration
         mul = {"s":1, "m":60, "h":3600, "d":86400, "w":604800}
@@ -533,6 +574,8 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
             return
         if not interaction.user.guild_permissions.kick_members:
             await interaction.response.send_message(embed=error_embed("Permission denied", "You lack Kick Members."))
+            return
+        if not await check_protected_target(interaction, user, "kicked"):
             return
         # DM before kicking
         dm_sent = False
