@@ -231,10 +231,17 @@ class MainBot(commands.Bot):
                             url = c.get("url") or c.get("html_url") or ""
                             if url.startswith("api."):
                                 url = url.replace("api.", "").replace("repos/", "")
-                            desc_lines.append(f"• `{sha}` {msg}")
+                            if url:
+                                desc_lines.append(f"• [`{sha}`]({url}) {msg}")
+                            else:
+                                desc_lines.append(f"• `{sha}` {msg}")
                         embed = info_embed(title, "\n".join(desc_lines))
                         if commits:
-                            embed.add_field(name="View", value=commits[0].get("url") or "")
+                            first_url = commits[0].get("url") or commits[0].get("html_url") or ""
+                            if first_url.startswith("api."):
+                                first_url = first_url.replace("api.", "").replace("repos/", "")
+                            if first_url:
+                                embed.add_field(name="View", value=f"[Commit Link]({first_url})")
                         await ch.send(embed=embed)
 
                     elif ev_type == "PullRequestEvent":
