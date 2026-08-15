@@ -461,6 +461,11 @@ def create_main_bot(db: Database, guild_id: Optional[int]) -> MainBot:
         dm_sent = False
         try:
             dm = info_embed("You have been banned", f"Server: {interaction.guild.name}\nModerator: {interaction.user.mention}\nReason: {reason}")
+            dm.add_field(
+                name="Appeal",
+                value="[Appeals Bot Link](https://discord.com/oauth2/authorize?client_id=1537874682601279551)",
+                inline=False,
+            )
             await user.send(embed=dm)
             dm_sent = True
         except Exception:
